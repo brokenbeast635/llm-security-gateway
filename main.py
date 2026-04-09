@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import re
@@ -14,7 +14,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── PII Patterns ───────────────────────────────────────────────────────────
+# ─── PII Patterns ────────────────────────────────────────────────────────────
 PII_PATTERNS = {
     "email":       r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
     "phone":       r'\b(\+92|0)?[0-9]{10,11}\b',
@@ -25,7 +25,7 @@ PII_PATTERNS = {
     "name":        r'\b(Mr\.|Mrs\.|Dr\.|Miss\.?)\s+[A-Z][a-z]+\b',
 }
 
-# ─── Injection Patterns ──────────────────────────────────────────────────────
+# ─── Injection Patterns ───────────────────────────────────────────────────────
 INJECTION_PATTERNS = [
     r'ignore\s+(all\s+)?(previous|prior|above)\s+instructions?',
     r'you\s+are\s+now\s+.*?(dan|jailbreak|evil|unrestricted)',
@@ -38,7 +38,19 @@ INJECTION_PATTERNS = [
     r'jailbreak',
     r'grandmother\s+exploit',
     r'(token\s+smuggling|virtual\s+scenario)',
+    r'no\s+restrictions',
+    r'without\s+(any\s+)?filters',
+    r'dan\s+mode',
+    r'evil\s+(mode|ai)',
 ]
+
+# ─── Thresholds ───────────────────────────────────────────────────────────────
+THRESHOLDS = {
+    "block_injection": 25,
+    "warn_injection":  15,
+    "block_pii":       3,
+    "mask_pii":        1,
+}
 
 class AnalyzeRequest(BaseModel):
     text: str
@@ -52,7 +64,11 @@ def detect_injection(text: str) -> dict:
             matched.append(pattern)
             score += 25
     score = min(score, 100)
-    return {"score": score, "matched_patterns": matched, "is_injection": score >= 50}
+    return {
+        "score": score,
+        "matched_patterns": matched,
+        "is_injection": score >= THRESHOLDS["block_injection"]
+    }
 
 def detect_pii(text: str) -> dict:
     found = {}
@@ -60,16 +76,27 @@ def detect_pii(text: str) -> dict:
     for label, pattern in PII_PATTERNS.items():
         matches = re.findall(pattern, text, re.IGNORECASE)
         if matches:
-            found[label] = matches
-            for match in matches:
-                m = match if isinstance(match, str) else match[0]
-                masked_text = masked_text.replace(m, f"[{label.upper()}_REDACTED]")
-    return {"pii_found": found, "masked_text": masked_text, "has_pii": len(found) > 0}
+            clean = [m if isinstance(m, str) else m[0] for m in matches if (m if isinstance(m, str) else m[0])]
+            if clean:
+                found[label] = clean
+                for m in clean:
+                    masked_text = masked_text.replace(m, f"[{label.upper()}_REDACTED]")
+    return {
+        "pii_found": found,
+        "masked_text": masked_text,
+        "has_pii": len(found) > 0
+    }
 
-def policy_engine(injection_result: dict, pii_result: dict) -> dict:
-    if injection_result["is_injection"]:
+def policy_engine(injection: dict, pii: dict) -> dict:
+    pii_count = sum(len(v) for v in pii["pii_found"].values())
+
+    if injection["is_injection"] and pii["has_pii"]:
+        return {"decision": "BLOCK", "reason": "Injection + PII detected", "color": "red"}
+    if injection["is_injection"]:
         return {"decision": "BLOCK", "reason": "Prompt injection detected", "color": "red"}
-    if pii_result["has_pii"]:
+    if pii_count >= THRESHOLDS["block_pii"]:
+        return {"decision": "BLOCK", "reason": f"{pii_count} PII entities exceed threshold", "color": "red"}
+    if pii["has_pii"]:
         return {"decision": "MASK", "reason": "PII detected and masked", "color": "orange"}
     return {"decision": "ALLOW", "reason": "Input is safe", "color": "green"}
 
@@ -81,21 +108,30 @@ def root():
 def analyze(req: AnalyzeRequest):
     start = time.time()
     injection = detect_injection(req.text)
-    pii = detect_pii(req.text)
-    policy = policy_engine(injection, pii)
-    latency = round((time.time() - start) * 1000, 2)
+    pii       = detect_pii(req.text)
+    policy    = policy_engine(injection, pii)
+    latency   = round((time.time() - start) * 1000, 2)
     return {
-        "original_text": req.text,
+        "original_text":       req.text,
         "injection_detection": injection,
-        "pii_detection": pii,
-        "policy": policy,
-        "latency_ms": latency,
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        "pii_detection":       pii,
+        "policy":              policy,
+        "latency_ms":          latency,
+        "timestamp":           time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 @app.get("/health")
 def health():
     return {"status": "healthy", "version": "1.0.0"}
+
+@app.get("/thresholds")
+def get_thresholds():
+    return THRESHOLDS
+
+@app.put("/thresholds")
+def update_thresholds(data: dict):
+    THRESHOLDS.update(data)
+    return {"updated": THRESHOLDS}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
